@@ -36,6 +36,7 @@ import subprocess
 import sys
 import time
 import uuid as _uuid_mod
+import webbrowser
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -269,6 +270,33 @@ def _req_get(url: str, headers: Optional[Dict] = None,
     except RequestException as e:
         logger.error("Request error %s: %s", url, e)
     return None
+
+
+def _abrir_no_browser(caminho: str) -> None:
+    """Open *caminho* (a local HTML file) in the user's default browser.
+
+    Uses the standard-library ``webbrowser`` module, which is cross-platform
+    (Windows, macOS, Linux).  The path is converted to an absolute ``file://``
+    URL so every OS can resolve it correctly.
+
+    If the browser cannot be launched (headless environment, missing DISPLAY,
+    permission error, etc.) the exception is caught and an informative message
+    is printed to the console — the main workflow is never interrupted.
+    """
+    try:
+        abs_path = os.path.realpath(caminho)
+        url = "file:///" + abs_path.replace("\\", "/")
+        webbrowser.open(url)
+        logger.info("Report opened in browser: %s", abs_path)
+    except Exception as exc:
+        logger.warning("Could not open browser: %s", exc)
+        print(
+            Fore.YELLOW
+            + f"  [!] Could not open the browser automatically.\n"
+              f"      Open the report manually at: {caminho}"
+            + Style.RESET_ALL
+        )
+
 
 # ─── Main banner ─────────────────────────────────────────────────────────────
 
@@ -4938,6 +4966,8 @@ function exportTxt() {{
         f.write(html)
     logger.info("HTML report saved: %s", caminho)
     print(Fore.LIGHTGREEN_EX + f"  -> HTML report saved at: {caminho}" + Style.RESET_ALL)
+    # Open the finished FindAPTGroups report in the user's default browser
+    _abrir_no_browser(str(caminho))
     return str(caminho)
 
 
@@ -6600,6 +6630,8 @@ def _gerar_html_attck(grupo: Any, dados: Dict, score: int) -> str:
         f.write(html)
     logger.info("ATT&CK report saved: %s", caminho)
     print(Fore.LIGHTGREEN_EX + f"  -> Report saved at: {caminho}" + Style.RESET_ALL)
+    # Open the finished FindAPTAttck report in the user's default browser
+    _abrir_no_browser(str(caminho))
     return str(caminho)
 
 
@@ -7848,6 +7880,8 @@ def _gerar_html_sigrules(metadados_regras: List[Dict], queries: Dict[str, str],
         f.write(html)
     logger.info("Relatório SigRules salvo: %s", caminho)
     print(Fore.LIGHTGREEN_EX + f"  -> Relatório salvo em: {caminho}" + Style.RESET_ALL)
+    # Open the finished FindSigRules report in the user's default browser
+    _abrir_no_browser(str(caminho))
     return str(caminho)
 
 
@@ -8824,6 +8858,8 @@ def _gerar_html_qgen(resultado: List[Dict], backend: str, stats: Dict) -> str:
         logger.warning("Could not write LLM HTML: %s", exc)
         return ""
 
+    # Open the finished LLM query report in the user's default browser
+    _abrir_no_browser(str(caminho))
     return str(caminho)
 
 
@@ -9577,6 +9613,8 @@ window.addEventListener('load', function() {{
         + f"\n  [*] Consolidated report saved at: {caminho}"
         + Style.RESET_ALL
     )
+    # Open the finished consolidated report in the user's default browser
+    _abrir_no_browser(str(caminho))
     return str(caminho)
 
 
