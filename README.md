@@ -1,15 +1,16 @@
 # CHIMERA — Threat Intelligence & Hunting Platform
 
-> **v2.0** · by X-Hunt3r
+> **v2.0** · by X-hunt3r
 
 ```
-╔══════════════════════════════════════════════════════════════════╗
-║            CHIMERA — Threat Intelligence & Hunting Platform      ║
-║            by X-Hunt3r  |  v2.0                                  ║
-╚══════════════════════════════════════════════════════════════════╝
-```
+<img width="607" height="411" alt="CHIMERA-removebg-preview (1)" src="https://github.com/user-attachments/assets/c48fe924-f3d3-46ff-88ae-cb90a2e79fb6" />
 
+```
 CHIMERA is an end-to-end threat intelligence and threat hunting platform that lets analysts go from a threat actor name all the way to SIEM-ready detection queries in a single workflow.
+
+## Overview
+
+<img width="1298" height="610" alt="Chime_Fluxo" src="https://github.com/user-attachments/assets/c77c97ca-605a-4a4f-98f3-675b5e6ecd6a" />
 
 The tool integrates four modules that can run independently or chained together:
 
