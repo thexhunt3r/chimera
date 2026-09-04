@@ -1,0 +1,18 @@
+# Chimera — Python Dependencies
+# Install with: pip install -r requirements.txt
+# Python 3.9+ required (3.11+ recommended)
+
+# ── HTTP and networking ────────────────────────────────────────────────────────
+requests>=2.32.3            # HTTP client for all external API calls
+
+# ── Terminal and interface ─────────────────────────────────────────────────────
+colorama>=0.4.6             # cross-platform ANSI terminal colors
+
+# ── Threat intelligence / data format ─────────────────────────────────────────
+stix2>=3.0.1                # STIX 2.1 export (optional, but recommended)
+
+# ── Sigma rule parsing ────────────────────────────────────────────────────────
+pyyaml>=6.0.2               # reads Sigma rule YAML files
+
+# ── Configuration and environment ─────────────────────────────────────────────
+python-dotenv>=1.0.1        # loads environment variables from the .env file
