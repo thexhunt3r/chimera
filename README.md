@@ -1,5 +1,5 @@
 # CHIMERA — Threat Intelligence & Hunting Platform
-<div align="center"><img width="607" height="411" alt="CHIMERA-CTIH" src="https://github.com/user-attachments/assets/c48fe924-f3d3-46ff-88ae-cb90a2e79fb6" /> </div>
+<div align="center"><img width="607" height="411" alt="CHIMERA-CTIH" src="https://github.com/thexhunt3r/chimera/blob/main/chimera_logo.png" /> </div>
 
 ```
 > v2.0 · by X-hunt3r
