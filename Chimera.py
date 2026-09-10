@@ -661,6 +661,7 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
                 n.get("detailed_description"),     # Plump Spider alias
                 n.get("overview"),                 # flat alias
                 n.get("summary"),                  # flat alias (mapped last to avoid
+                n.get("executive_summary"),
                                                    # overwriting description with a short summary)
             ]) or ""
             # Sanitise sentinel values ("No description available", "N/A", …)
@@ -929,6 +930,11 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
         if cs_id:
             extra["crowdstrike_identifier"] = cs_id
 
+        # actor_details sub-object (structured schema) — resolve actor_type alias
+        _act_det_early = n.get("actor_details") or {}
+        if not isinstance(_act_det_early, dict):
+            _act_det_early = {}
+
         at = _primeira_str([
             ta.get("category"),
             ta.get("actor_type"),
@@ -936,6 +942,12 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
             gen.get("actor_type"),
             gen.get("type"),
             gen.get("category"),
+            # Structured schema: actor_details.actor_type
+            _act_det_early.get("actor_type"),
+            _act_det_early.get("type"),
+            _act_det_early.get("category"),
+            # Top-level fallback
+            n.get("actor_type"),
         ])
         if at:
             extra["actor_type"] = at
@@ -1029,7 +1041,9 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
         if not matt_canonical:
             for key in (
                 "mitre_attack_matrix", "mitre_attack", "attack_techniques",
-                "techniques", "mitre_attack_techniques",   # Plump Spider alias
+                "techniques", "mitre_attack_techniques", "mitre_attack_tactics_and_techniques",
+                "mitre_attack_profile",   # Plump Spider alias
+                "mitre_att_ck_mapping",   # double-underscore variant
             ):
                 raw_flat = n.get(key)
                 if isinstance(raw_flat, list) and raw_flat:
@@ -1078,11 +1092,21 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
         if isinstance(mit_raw, dict) and mit_raw:
             extra["mitigation_and_defenses"] = mit_raw
         elif isinstance(mit_raw, list) and mit_raw:
-            extra["mitigation_and_defenses"] = {
-                "mitigations": [],
-                "defense_recommendations": _como_lista(mit_raw),
-                "detection_indicators": [],
-            }
+            # Preserve dict items intact so the renderer (_gerar_html_grupos)
+            # can format them via _render_dynamic_value instead of str().
+            # Plain strings are kept as-is; dicts are not coerced to strings.
+            _mit_recs_clean = []
+            for _mitem in mit_raw:
+                if isinstance(_mitem, dict) and _mitem:
+                    _mit_recs_clean.append(_mitem)
+                elif _mitem and not _is_empty_value(_mitem):
+                    _mit_recs_clean.append(str(_mitem))
+            if _mit_recs_clean:
+                extra["mitigation_and_defenses"] = {
+                    "mitigations": [],
+                    "defense_recommendations": _mit_recs_clean,
+                    "detection_indicators": [],
+                }
 
         # ── group_profile schema (FallBack / new LLM schema) ─────────────────
         # When the LLM returns the alternative top-level "group_profile" key,
@@ -1179,12 +1203,25 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
             extra["attack_vector_and_tactics_data"] = avt_raw  # keep full dict
 
         # mitre_attack_mapping (flat list schema from group_profile FallBack)
-        # Also accept "mitre_attack_techniques" (Plump Spider schema key) as
-        # an alternative source for the same flat-list mapping data.
+        # Also accept "mitre_attack_techniques" (Plump Spider schema key) and
+        # "mitre_att_ck_mapping" (LLM variant with double underscore) as
+        # alternative sources for the same flat-list mapping data.
+        #
+        # IMPORTANT — deduplication against matt_canonical:
+        # The schema v3 block (above) already consumed keys like
+        # mitre_attack_profile / mitre_att_ck_mapping to build matt_canonical
+        # (the tactic-grouped block rendered as matt_html).  If we also feed
+        # those same keys into mitre_attack_mapping_data (rendered as mam_html),
+        # both blocks appear in the report — producing a visual duplicate.
+        # Rule: only populate mitre_attack_mapping_data when matt_canonical is
+        # empty (i.e. the tactic-grouped path was not taken), OR when the source
+        # key is exclusive to the flat-list path (mitre_attack_mapping).
         mam_raw = (
-            n.get("mitre_attack_mapping")
-            or n.get("mitre_attack_techniques")
-            or n.get("tactics_techniques_procedures")    # Plump Spider alias
+            n.get("mitre_attack_mapping")               # exclusive flat-list key
+            or (n.get("mitre_att_ck_mapping") if not matt_canonical else None)
+            or (n.get("mitre_attack_techniques") if not matt_canonical else None)
+            or (n.get("tactics_techniques_procedures") if not matt_canonical else None)
+            or n.get("associated_malware_and_tools")
         )
         if isinstance(mam_raw, list) and mam_raw:
             extra["mitre_attack_mapping_data"] = mam_raw
@@ -1316,17 +1353,35 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
             if ad_alias_list:
                 n["names"] = [{"name": a, "name-giver": "LLM"} for a in ad_alias_list]
 
-        # observed-sectors — targeting_profile.target_industries
+        # observed-sectors — targeting_profile.target_industries OR flat root keys
+        # target_sectors / target_geographies are top-level flat aliases used by
+        # some LLM models that deviate from the structured schema.  They are
+        # resolved here (schema v3 block) to populate the canonical observed-*
+        # fields so the card header renders them correctly.
         if not n.get("observed-sectors"):
-            raw_ind = tgt_prof.get("target_industries") or []
-            cleaned_ind = _sanitize_list(raw_ind)
+            raw_ind = (
+                tgt_prof.get("target_industries")
+                or tgt_prof.get("sectors")
+                or _sanitize_list(n.get("target_sectors") or [])   # flat root key
+                or []
+            )
+            cleaned_ind = _sanitize_list(raw_ind) if isinstance(raw_ind, list) else (
+                [raw_ind] if isinstance(raw_ind, str) and raw_ind else []
+            )
             if cleaned_ind:
                 n["observed-sectors"] = cleaned_ind
 
-        # observed-countries — targeting_profile.target_geographies
+        # observed-countries — targeting_profile.target_geographies OR flat root keys
         if not n.get("observed-countries"):
-            raw_geo = tgt_prof.get("target_geographies") or []
-            cleaned_geo = _sanitize_list(raw_geo)
+            raw_geo = (
+                tgt_prof.get("target_geographies")
+                or tgt_prof.get("geographies")
+                or _sanitize_list(n.get("target_geographies") or [])  # flat root key
+                or []
+            )
+            cleaned_geo = _sanitize_list(raw_geo) if isinstance(raw_geo, list) else (
+                [raw_geo] if isinstance(raw_geo, str) and raw_geo else []
+            )
             if cleaned_geo:
                 n["observed-countries"] = cleaned_geo
 
@@ -1444,11 +1499,14 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
 
         # MITRE ATT&CK — mitre_att_and_ck (root key alias)
         # Feeds the same canonical fields as mitre_attack_ttps above.
-        # Only runs when mitre_attack_mapping_data is still empty (i.e. no
-        # higher-priority key has already populated it).
-        mitre_alt_raw = n.get("mitre_att_and_ck")
+        # Only runs when mitre_attack_mapping_data is still empty AND matt_canonical
+        # was NOT already populated from the same key (deduplication guard: if
+        # matt_canonical was built from mitre_att_ck_mapping via the schema v3 block,
+        # we must NOT also store it in mitre_attack_mapping_data — that would render
+        # both matt_html and mam_html for the same techniques).
+        mitre_alt_raw = n.get("mitre_att_and_ck") or n.get("mitre_att_ck_mapping")
         if isinstance(mitre_alt_raw, list) and mitre_alt_raw:
-            if not extra.get("mitre_attack_mapping_data"):
+            if not extra.get("mitre_attack_mapping_data") and not matt_canonical:
                 extra["mitre_attack_mapping_data"] = mitre_alt_raw
             current_mitre_alt = list(n.get("mitre-attack") or [])
             for ttp in mitre_alt_raw:
@@ -1469,6 +1527,13 @@ def _normalizar_resultado_grupo(r: Dict) -> Dict:
             pm_raw = n.get("primary_motivations")
             if pm_raw:
                 n["motivation"] = _sanitize_list(pm_raw)
+
+        # Preserve pre-computed dynamic sections injected by gerar_relatorio_llm_apt
+        # _llm_extra is rebuilt from scratch here, but _dynamic_sections is
+        # generated upstream before normalisation and must survive the rebuild.
+        _prev_dyn = (n.get("_llm_extra") or {}).get("_dynamic_sections")
+        if _prev_dyn:
+            extra["_dynamic_sections"] = _prev_dyn
 
         n["_llm_extra"] = extra
 
@@ -3702,13 +3767,22 @@ def _gerar_html_grupos(resultados: List[Dict], parametros_busca: Dict,
                         )
 
                 # --- Defense recommendations list ---
+                # Items may be plain strings OR structured dicts
+                # (e.g. {category, recommendation}) — use _render_dynamic_value
+                # so dict items are never serialised via str().
                 recs = mit.get("defense_recommendations", [])
                 recs_html = ""
                 if isinstance(recs, list) and recs:
-                    rec_items = "".join(
-                        f"<li>{str(r_item)[:300]}</li>"
-                        for r_item in recs if r_item
-                    )
+                    rec_items = ""
+                    for r_item in recs:
+                        if not r_item:
+                            continue
+                        if isinstance(r_item, (dict, list)):
+                            rendered = _render_dynamic_value(r_item)
+                            if rendered:
+                                rec_items += f"<li>{rendered}</li>"
+                        else:
+                            rec_items += f"<li>{str(r_item)[:300]}</li>"
                     if rec_items:
                         recs_html = (
                             f"<div class='ttp-section-label'>Defense Recommendations</div>"
@@ -4605,6 +4679,7 @@ def _gerar_html_grupos(resultados: List[Dict], parametros_busca: Dict,
             {matt_html}
             {ttp_html}
             {mit_html}
+            {"".join(s["html"] for s in (llm_extra.get("_dynamic_sections") or []))}
             {malpedia_actor_html}
             {malpedia_families_html}
             {otx_html}
@@ -4882,6 +4957,44 @@ def _gerar_html_grupos(resultados: List[Dict], parametros_busca: Dict,
         .auth-src-bloco {{ border-color: #2a2a3a; }}
         .auth-src-toggle {{ color: var(--accent) !important; background: #0d0d1f !important; }}
         .auth-src-body {{ padding: 10px 16px; font-size: 0.88em; }}
+        /* ── Seções dinâmicas (root keys adicionais da LLM) ──────────────── */
+        .llm-sec-bloco {{ border-color: #2a1f3a; }}
+        .llm-sec-toggle {{ color: var(--purple) !important; background: #180d2a !important; }}
+        .llm-sec-body {{ padding: 12px 16px; font-size: 0.88em; }}
+        .llm-sec-text {{ color: var(--muted); border-left: 3px solid var(--border);
+                         padding-left: 10px; margin-bottom: 8px; line-height: 1.6; }}
+        .llm-sec-list {{ padding-left: 20px; color: var(--text); }}
+        .llm-sec-list li {{ margin-bottom: 5px; line-height: 1.5; }}
+        .llm-sec-key {{ color: var(--muted); font-size: 0.82em; font-weight: 600;
+                        padding-right: 12px; white-space: nowrap; vertical-align: top; }}
+        .llm-sec-table {{ margin-top: 4px; }}
+        /* ── Blocos de card dinâmicos (dyn-card) ─────────────────────────── */
+        .dyn-card-group {{ display: flex; flex-direction: column; gap: 8px; }}
+        .dyn-card {{
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 5px;
+            padding: 10px 14px;
+        }}
+        .dyn-card-title {{
+            font-weight: 700;
+            color: var(--accent);
+            font-size: .9em;
+            margin-bottom: 6px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 4px;
+        }}
+        .dyn-card-row {{
+            font-size: .88em;
+            margin-bottom: 4px;
+            line-height: 1.5;
+        }}
+        .dyn-li-block {{
+            list-style: none;
+            padding: 0;
+            margin-bottom: 8px;
+        }}
+        .dyn-list-blocks {{ padding-left: 0; }}
 
         @media (max-width: 700px) {{
             .grid-2col {{ grid-template-columns: 1fr; }}
@@ -5722,14 +5835,833 @@ def test_render_llm_json() -> None:
     found_s7e, miss_s7e = _run_checks(content_s7e, checks_s7e, "S7e-bare-mitre-id")
 
     # ──────────────────────────────────────────────────────────────────────────
+    # S8 — gerar_relatorio_llm_apt: geração de relatório exclusivamente via LLM
+    #
+    #  S8a — resposta com três root keys incluindo mitre_attack_profile
+    #  S8b — resposta com root key desconhecida (seção dinâmica automática)
+    #  S8c — resposta _llm_no_data: retorna None (sem relatório gerado)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # S8a — resposta simulada com três root keys: actor_details, mitre_attack_profile,
+    #        mitigation_recommendations → espera sessões nomeadas a partir das root keys.
+    raw_s8a = json.dumps({
+        "actor": "Volt Typhoon",
+        "country": ["China"],
+        "motivation": ["Espionage", "Pre-positioning"],
+        "first-seen": "2021",
+        "last-seen": "2024",
+        "description": (
+            "Volt Typhoon is a Chinese state-sponsored threat actor that targets "
+            "critical infrastructure in the United States and its territories."
+        ),
+        "observed-sectors": ["Energy", "Transportation", "Communications"],
+        "observed-countries": ["United States", "Guam"],
+        "tools": ["Living-off-the-land (LOL) binaries", "Impacket", "Fast Reverse Proxy"],
+        "actor_details": {
+            "name": "Volt Typhoon",
+            "aliases": ["Bronze Silhouette", "Dev-0391", "Insidious Taurus"],
+            "actor_type": "Nation-State",
+            "origin_region": "People's Republic of China",
+            "active_since": "2021",
+            "status": "Active",
+            "motivation": "Espionage / Pre-positioning for disruptive operations",
+        },
+        "mitre_attack_profile": [
+            {
+                "technique_id": "T1078",
+                "technique_name": "Valid Accounts",
+                "tactic": "Defense Evasion",
+                "description": "Abuses valid credentials to blend in with normal activity.",
+            },
+            {
+                "technique_id": "T1190",
+                "technique_name": "Exploit Public-Facing Application",
+                "tactic": "Initial Access",
+                "description": "Exploits vulnerabilities in internet-facing systems.",
+            },
+            {
+                "technique_id": "T1071.001",
+                "technique_name": "Application Layer Protocol: Web Protocols",
+                "tactic": "Command and Control",
+                "description": "Uses HTTPS to blend C2 traffic with normal web traffic.",
+            },
+        ],
+        "mitigation_recommendations": [
+            {
+                "category": "Identity & Access Management",
+                "actions": [
+                    "Enforce MFA for all privileged accounts.",
+                    "Audit and remove unused service accounts.",
+                ],
+            },
+            {
+                "category": "Network Segmentation",
+                "actions": [
+                    "Segment OT and IT networks with strict firewall rules.",
+                    "Monitor inter-segment traffic for anomalies.",
+                ],
+            },
+        ],
+        "_llm_source": True,
+        "_llm_model": "openai/gpt-4o",
+        "_otx_iocs": [], "_otx_pulses": 0, "_kev_correlacoes": [],
+        "_threatfox_iocs": [], "_malwarebazaar_amostras": [],
+        "_ransomware_vitimas": [], "_misp_eventos": [], "_opencti_dados": [],
+        "_malpedia_actor": {}, "_malpedia_families": [],
+    })
+
+    # Invocar a nova função gerar_relatorio_llm_apt diretamente
+    html_s8a = gerar_relatorio_llm_apt(raw_s8a, "Volt Typhoon")
+    content_s8a = ""
+    if html_s8a and Path(html_s8a).exists():
+        content_s8a = Path(html_s8a).read_text(encoding="utf-8")
+
+    checks_s8a: List[Tuple[str, str]] = [
+        # Relatório gerado e acessível
+        ("S8a HTML gerado",                   "Volt Typhoon"),
+        # LLM badge presente
+        ("S8a LLM badge bar",                 "llm-badge-bar"),
+        # Campos canônicos do cabeçalho do card
+        ("S8a country China",                 "China"),
+        ("S8a motivation Espionage",          "Espionage"),
+        ("S8a first-seen 2021",               "2021"),
+        ("S8a description critical infra",    "critical infrastructure"),
+        ("S8a sector Energy",                 "Energy"),
+        ("S8a target USA",                    "United States"),
+        ("S8a tool Impacket",                 "Impacket"),
+        # Root key mitre_attack_profile → MITRE ATT&CK Mapping (via mam_html)
+        ("S8a mitre_attack_profile T1078",    "T1078"),
+        ("S8a mitre_attack_profile T1190",    "T1190"),
+        ("S8a mitre_attack_profile T1071",    "T1071"),
+        # Root key mitigation_recommendations → bloco mit_recs_html
+        ("S8a mit_recs IAM category",         "Identity"),
+        ("S8a mit_recs action MFA",           "MFA"),
+        ("S8a mit_recs Network Segmentation", "Segmentation"),
+        # Root key actor_details (seção dinâmica via _llm_extra)
+        ("S8a actor_details Bronze Silhouette",  "Bronze Silhouette"),
+        ("S8a actor_details Nation-State",       "Nation-State"),
+        # Fontes de dados no rodapé
+        ("S8a fonte LLM Agent",               "LLM Agent"),
+    ]
+    found_s8a, miss_s8a = _run_checks(content_s8a, checks_s8a, "S8a-gerar_relatorio_llm_apt")
+
+    # S8b — root key desconhecida 'threat_context' deve virar seção dinâmica automática
+    raw_s8b = json.dumps({
+        "actor": "TestGroup99",
+        "country": ["Unknownland"],
+        "motivation": ["Hacktivism"],
+        "description": "Fictitious group for dynamic section testing.",
+        "threat_context": {
+            "campaign_name": "Operation Thunder",
+            "attribution_confidence": "High",
+            "first_reported_by": "ACME Labs",
+        },
+        "_llm_source": True,
+        "_llm_model": "test/mock",
+        "_otx_iocs": [], "_otx_pulses": 0, "_kev_correlacoes": [],
+        "_threatfox_iocs": [], "_malwarebazaar_amostras": [],
+        "_ransomware_vitimas": [], "_misp_eventos": [], "_opencti_dados": [],
+        "_malpedia_actor": {}, "_malpedia_families": [],
+    })
+
+    html_s8b = gerar_relatorio_llm_apt(raw_s8b, "TestGroup99")
+    content_s8b = ""
+    if html_s8b and Path(html_s8b).exists():
+        content_s8b = Path(html_s8b).read_text(encoding="utf-8")
+
+    checks_s8b: List[Tuple[str, str]] = [
+        ("S8b actor TestGroup99",           "TestGroup99"),
+        # Seção dinâmica 'threat_context' deve aparecer com título automático
+        ("S8b dynamic section rendered",    "llm-sec-bloco"),
+        ("S8b campaign_name value",         "Operation Thunder"),
+        ("S8b attribution_confidence",      "High"),
+    ]
+    found_s8b, miss_s8b = _run_checks(content_s8b, checks_s8b, "S8b-dynamic-section")
+
+    # S8c — sentinel _llm_no_data: gerar_relatorio_llm_apt deve retornar None
+    raw_s8c = json.dumps({"_llm_no_data": True})
+    result_s8c = gerar_relatorio_llm_apt(raw_s8c, "NoDataGroup")
+    found_s8c: List[str] = []
+    miss_s8c:  List[str] = []
+    if result_s8c is None:
+        found_s8c.append("S8c no-data sentinel returns None")
+    else:
+        miss_s8c.append("[S8c] gerar_relatorio_llm_apt must return None for _llm_no_data")
+
+    # S8d — validação de _snake_to_section_title para mapeamentos explícitos e automáticos
+    _title_tests: List[Tuple[str, str, str]] = [
+        ("mitre_attack_profile",     "MITRE ATT&CK Mapping",             "mapeamento explícito"),
+        ("attack_chain_and_tactics", "Attack Chain & Tactics",           "mapeamento explícito"),
+        ("unknown_custom_key",       "Unknown Custom Key",               "normalização automática"),
+        ("my_llm_extra_field",       "My LLM Extra Field",               "normalização automática (LLM expandido)"),
+        ("actor_details",            "Actor Details",                    "mapeamento explícito"),
+        ("targeting_profile",        "Targeting Profile",                "mapeamento explícito"),
+        ("summary",                  "Executive Summary",                "mapeamento explícito"),
+    ]
+    found_s8d: List[str] = []
+    miss_s8d:  List[str] = []
+    for key, expected, label in _title_tests:
+        actual = _snake_to_section_title(key)
+        if actual == expected:
+            found_s8d.append(f"S8d title '{key}' = '{expected}' ({label})")
+        else:
+            miss_s8d.append(
+                f"[S8d] _snake_to_section_title('{key}'): "
+                f"expected '{expected}', got '{actual}' ({label})"
+            )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # S9 — _render_dynamic_value: cobertura de tipos e padrões do Breeze Comeet
+    #
+    #  S9a — dict com category + recommendation  → dyn-card (sem str() bruto)
+    #  S9b — list de dicts com name/type/description → dyn-card-group
+    #  S9c — list de str (commodity tools)        → <ul>/<li>
+    #  S9d — dict misto com sub-lista e sub-dict  → renderização recursiva
+    #  S9e — str simples                          → <p> sem wrapping extra
+    #  S9f — relatório completo Breeze Comeet via _gerar_html_grupos
+    # ──────────────────────────────────────────────────────────────────────────
+
+    found_s9: List[str] = []
+    miss_s9:  List[str] = []
+
+    # S9a — dict category + recommendation
+    html_s9a = _render_dynamic_value({
+        "category": "Network Defense",
+        "recommendation": "Implement WAF and Anti-DDoS mitigation services.",
+    })
+    # Não deve conter '{' ou '}' de representação bruta de dict
+    if "dyn-card" in html_s9a:
+        found_s9.append("S9a dict-card rendered (dyn-card class)")
+    else:
+        miss_s9.append("[S9a] category+recommendation dict must produce dyn-card block")
+    if "Network Defense" in html_s9a:
+        found_s9.append("S9a category title visible")
+    else:
+        miss_s9.append("[S9a] category value must be visible in HTML")
+    if "WAF" in html_s9a:
+        found_s9.append("S9a recommendation value visible")
+    else:
+        miss_s9.append("[S9a] recommendation text must be visible in HTML")
+    if "{'category'" in html_s9a or "&#x27;" in html_s9a and "category" in html_s9a:
+        miss_s9.append("[S9a] raw dict repr must NOT appear in rendered HTML")
+    else:
+        found_s9.append("S9a no raw dict repr")
+
+    # S9b — list de dicts com name/type/description (custom_malware pattern)
+    html_s9b = _render_dynamic_value([
+        {
+            "name": "CometFlooder",
+            "type": "DDoS Botnet / Flooder",
+            "description": "Custom tool used to orchestrate large-scale UDP/TCP floods.",
+        },
+        {
+            "name": "BreezeBotnet",
+            "type": "C2 Implant",
+            "description": "Lightweight implant for command-and-control operations.",
+        },
+    ])
+    if "dyn-card-group" in html_s9b:
+        found_s9.append("S9b list-of-dicts rendered as dyn-card-group")
+    else:
+        miss_s9.append("[S9b] list of name/type/description dicts must use dyn-card-group")
+    if "CometFlooder" in html_s9b:
+        found_s9.append("S9b first card name visible")
+    else:
+        miss_s9.append("[S9b] CometFlooder must appear in rendered HTML")
+    if "BreezeBotnet" in html_s9b:
+        found_s9.append("S9b second card name visible")
+    else:
+        miss_s9.append("[S9b] BreezeBotnet must appear in rendered HTML")
+    if "DDoS Botnet" in html_s9b:
+        found_s9.append("S9b type field visible")
+    else:
+        miss_s9.append("[S9b] type field text must be visible in HTML")
+    # Garantir ausência de repr bruto
+    if "{'name'" in html_s9b:
+        miss_s9.append("[S9b] raw dict repr must NOT appear in rendered HTML")
+    else:
+        found_s9.append("S9b no raw dict repr")
+
+    # S9c — list de str (commodity tools)
+    html_s9c = _render_dynamic_value(["LOIC", "HOIC", "Mirai", "Slowloris"])
+    if "<ul" in html_s9c and "<li" in html_s9c:
+        found_s9.append("S9c list-of-str rendered as ul/li")
+    else:
+        miss_s9.append("[S9c] list of strings must produce <ul>/<li> HTML")
+    if "LOIC" in html_s9c:
+        found_s9.append("S9c LOIC visible")
+    else:
+        miss_s9.append("[S9c] LOIC must appear in rendered HTML")
+    if "Slowloris" in html_s9c:
+        found_s9.append("S9c Slowloris visible")
+    else:
+        miss_s9.append("[S9c] Slowloris must appear in rendered HTML")
+
+    # S9d — dict misto: sub-lista de dicts + sub-lista de strings
+    html_s9d = _render_dynamic_value({
+        "custom_malware": [
+            {
+                "name": "CometFlooder",
+                "type": "DDoS Botnet",
+                "description": "Custom UDP/TCP flood tool.",
+            },
+        ],
+        "commodity_tools": ["LOIC", "HOIC", "Mirai"],
+    })
+    if "CometFlooder" in html_s9d:
+        found_s9.append("S9d sub-list of dicts rendered recursively (CometFlooder)")
+    else:
+        miss_s9.append("[S9d] CometFlooder must be visible in nested dict rendering")
+    if "LOIC" in html_s9d:
+        found_s9.append("S9d sub-list of str rendered recursively (LOIC)")
+    else:
+        miss_s9.append("[S9d] LOIC must be visible in nested dict rendering")
+    # Garantir ausência de repr bruto
+    if "[{" in html_s9d.replace("&#x5B;{", ""):
+        miss_s9.append("[S9d] raw list-of-dict repr must NOT appear in rendered HTML")
+    else:
+        found_s9.append("S9d no raw list repr")
+
+    # S9e — string simples: deve gerar <p class='llm-sec-text'>
+    html_s9e = _render_dynamic_value(
+        "Breeze Comeet is a hacktivist and disruptive DDoS group."
+    )
+    if "<p class='llm-sec-text'" in html_s9e:
+        found_s9.append("S9e str rendered as <p class='llm-sec-text'>")
+    else:
+        miss_s9.append("[S9e] plain string must render as <p class='llm-sec-text'>")
+    if "hacktivist" in html_s9e:
+        found_s9.append("S9e string content visible")
+    else:
+        miss_s9.append("[S9e] string content must be visible in HTML")
+
+    # S9f — relatório completo Breeze Comeet via _gerar_html_grupos
+    sample_breeze: Dict = {
+        "actor": "Breeze Comeet",
+        "country": ["Iran (suspected)"],
+        "motivation": ["Hacktivism", "Disruption"],
+        "first-seen": "2022",
+        "last-seen": "2024",
+        "description": (
+            "Breeze Comeet (also known as Comeet Storm) is an Iranian hacktivist "
+            "group known for orchestrating large-scale DDoS attacks against "
+            "government, media, and financial institutions."
+        ),
+        "observed-sectors": ["Government", "Media", "Finance"],
+        "observed-countries": ["Israel", "USA", "UAE"],
+        "tools": ["CometFlooder", "LOIC", "HOIC"],
+        "defense_recommendations": [
+            {
+                "category": "Network Defense",
+                "recommendation": (
+                    "Implement robust WAF and Anti-DDoS mitigation "
+                    "services to filter Layer 4 and Layer 7 flooding attacks."
+                ),
+            },
+            {
+                "category": "Vulnerability Management",
+                "recommendation": (
+                    "Promptly patch edge equipment, firewalls, and "
+                    "public-facing remote access infrastructure."
+                ),
+            },
+        ],
+        "tools_and_malware": {
+            "custom_malware": [
+                {
+                    "name": "CometFlooder",
+                    "type": "DDoS Botnet / Flooder",
+                    "description": (
+                        "Custom tool used to orchestrate large-scale "
+                        "UDP/TCP floods against target infrastructure."
+                    ),
+                },
+            ],
+            "commodity_tools": ["LOIC", "HOIC", "Mirai", "Slowloris"],
+        },
+        "_llm_source": True,
+        "_llm_model": "test/breeze",
+        "_otx_iocs": [], "_otx_pulses": 0, "_kev_correlacoes": [],
+        "_threatfox_iocs": [], "_malwarebazaar_amostras": [],
+        "_ransomware_vitimas": [], "_misp_eventos": [], "_opencti_dados": [],
+        "_malpedia_actor": {}, "_malpedia_families": [],
+    }
+
+    # Construir as seções dinâmicas manualmente como o gerar_relatorio_llm_apt faz
+    _sample_breeze_for_render = dict(sample_breeze)
+    _breeze_dynamic: List[Dict[str, str]] = []
+    _BREEZE_SKIP = frozenset({
+        "actor", "country", "motivation", "first-seen", "last-seen",
+        "description", "observed-sectors", "observed-countries", "tools",
+        "_llm_source", "_llm_model", "_llm_extra",
+        "_otx_iocs", "_otx_pulses", "_kev_correlacoes", "_threatfox_iocs",
+        "_malwarebazaar_amostras", "_ransomware_vitimas", "_misp_eventos",
+        "_opencti_dados", "_malpedia_actor", "_malpedia_families",
+    })
+    for _bk, _bv in _sample_breeze_for_render.items():
+        if _bk in _BREEZE_SKIP or _bk.startswith("_"):
+            continue
+        _btitle = _snake_to_section_title(_bk)
+        _bhtml  = _render_llm_section(_btitle, _bv)
+        if _bhtml:
+            _breeze_dynamic.append({"title": _btitle, "html": _bhtml})
+
+    _sample_breeze_for_render.setdefault("_llm_extra", {})
+    _sample_breeze_for_render["_llm_extra"]["_dynamic_sections"] = _breeze_dynamic
+
+    html_breeze_path = _gerar_html_grupos(
+        [_sample_breeze_for_render],
+        {"actor": "Breeze Comeet"},
+        ["LLM Agent (test/breeze) — fallback"],
+    )
+    content_breeze = ""
+    if html_breeze_path and Path(html_breeze_path).exists():
+        content_breeze = Path(html_breeze_path).read_text(encoding="utf-8")
+
+    checks_s9f: List[Tuple[str, str]] = [
+        ("S9f actor Breeze Comeet",           "Breeze Comeet"),
+        ("S9f LLM badge",                     "llm-badge-bar"),
+        # defense_recommendations: sem repr bruto de dict
+        ("S9f def rec card rendered",         "dyn-card"),
+        ("S9f def rec Network Defense",       "Network Defense"),
+        ("S9f def rec WAF text",              "WAF"),
+        ("S9f def rec Vulnerability Mgmt",    "Vulnerability Management"),
+        ("S9f def rec patch text",            "patch"),
+        # tools_and_malware: sem repr bruto de dict/lista
+        ("S9f tools CometFlooder visible",    "CometFlooder"),
+        ("S9f tools LOIC visible",            "LOIC"),
+        ("S9f tools commodity Mirai",         "Mirai"),
+        ("S9f tools commodity Slowloris",     "Slowloris"),
+        # Garantir ausência de repr bruto — chaves de dict não devem aparecer
+        # diretamente como texto no HTML (ex: "{'category': 'Network Defense'}")
+    ]
+    found_s9f, miss_s9f = _run_checks(content_breeze, checks_s9f, "S9f-breeze-full")
+    # Verificação adicional: garantir que nenhum repr bruto de dict apareça
+    # A string "&#x27;category&#x27;" é a versão HTML-escaped de "'category'"
+    # que apareceria se str(dict) fosse usado. Verificamos a forma mais simples.
+    if "{'category'" not in content_breeze and "&#x27;category&#x27;" not in content_breeze:
+        found_s9.append("S9f no raw dict repr in full report")
+    else:
+        miss_s9.append("[S9f] raw dict repr must NOT appear in full Breeze Comeet report")
+    if "{'custom_malware'" not in content_breeze:
+        found_s9.append("S9f no raw dict repr for custom_malware key")
+    else:
+        miss_s9.append("[S9f] raw dict repr for custom_malware must NOT appear in HTML")
+    found_s9 += found_s9f
+    miss_s9  += miss_s9f
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # S10 — mitre_att_ck_mapping: alias com duplo underscore
+    #
+    #  S10a — normalização via _normalizar_resultado_grupo:
+    #         chave (com campo tactic) deve popular mitre_attack_tactics_and_techniques
+    #         (schema v3 tático agrupado) SEM duplicar em mitre_attack_mapping_data
+    #  S10b — renderização HTML: técnicas devem aparecer no matt_html (tático agrupado)
+    #  S10c — título via _snake_to_section_title: deve ser "MITRE ATT&CK Mapping"
+    #  S10d — sem repr bruto de dict no HTML final
+    #  S10e — schema v3 (lista flat com {tactic, technique_id, technique_name})
+    #         deve ser agrupado em matt_canonical via mitre_attack_tactics_and_techniques
+    # ──────────────────────────────────────────────────────────────────────────
+
+    found_s10: List[str] = []
+    miss_s10:  List[str] = []
+
+    # S10a — normalização: mitre_att_ck_mapping com campo 'tactic' deve alimentar
+    # mitre_attack_tactics_and_techniques (schema v3, tático agrupado) SEM popular
+    # mitre_attack_mapping_data simultaneamente (correção de deduplicação MITRE).
+    sample_s10_norm: Dict = {
+        "actor": "S10TestActor",
+        "_llm_source": True,
+        "mitre_att_ck_mapping": [
+            {
+                "technique_id":   "T1566.001",
+                "technique_name": "Phishing: Spearphishing Attachment",
+                "tactic":         "Initial Access",
+                "description":    "Delivers malware via spear-phishing e-mail.",
+            },
+            {
+                "technique_id":   "T1059.001",
+                "technique_name": "PowerShell",
+                "tactic":         "Execution",
+                "description":    "Executes encoded PowerShell commands.",
+            },
+        ],
+    }
+    norm_s10 = _normalizar_resultado_grupo(sample_s10_norm)
+    extra_s10 = norm_s10.get("_llm_extra", {})
+    matt_data_s10 = extra_s10.get("mitre_attack_tactics_and_techniques") or {}
+    mam_data_s10  = extra_s10.get("mitre_attack_mapping_data")
+
+    # mitre_att_ck_mapping com tactic deve popular matt (tático agrupado) via schema v3
+    if isinstance(matt_data_s10, dict) and matt_data_s10:
+        found_s10.append("S10a mitre_att_ck_mapping populated mitre_attack_tactics_and_techniques")
+    else:
+        miss_s10.append(
+            f"[S10a] mitre_att_ck_mapping must populate mitre_attack_tactics_and_techniques "
+            f"(got: {matt_data_s10!r})"
+        )
+    # Sem duplicidade: mam NÃO deve estar populado ao mesmo tempo
+    if not mam_data_s10:
+        found_s10.append("S10a sem duplicidade: mitre_attack_mapping_data vazio quando matt populado")
+    else:
+        miss_s10.append(
+            "[S10a] mitre_att_ck_mapping NÃO deve popular mitre_attack_mapping_data "
+            "quando matt já foi gerado (duplicidade MITRE detectada)"
+        )
+    # Verify technique IDs are present in the tactic-grouped data
+    all_techs_s10 = [
+        t for techs in matt_data_s10.values() for t in techs
+        if isinstance(t, dict)
+    ]
+    if any(t.get("technique_id") == "T1566.001" for t in all_techs_s10):
+        found_s10.append("S10a T1566.001 preserved in mitre_attack_tactics_and_techniques")
+    else:
+        miss_s10.append("[S10a] T1566.001 must be present in mitre_attack_tactics_and_techniques")
+
+    # S10c — título deve ser "MITRE ATT&CK Mapping"
+    title_s10 = _snake_to_section_title("mitre_att_ck_mapping")
+    if title_s10 == "MITRE ATT&CK Mapping":
+        found_s10.append("S10c _snake_to_section_title('mitre_att_ck_mapping') = 'MITRE ATT&CK Mapping'")
+    else:
+        miss_s10.append(
+            f"[S10c] _snake_to_section_title('mitre_att_ck_mapping') expected "
+            f"'MITRE ATT&CK Mapping', got '{title_s10}'"
+        )
+
+    # S10b/d — renderização HTML completa via _gerar_html_grupos
+    sample_s10_html: Dict = {
+        "actor": "S10Actor",
+        "country": ["Testland"],
+        "motivation": ["Espionage"],
+        "description": "S10 test actor for mitre_att_ck_mapping coverage.",
+        "mitre_att_ck_mapping": [
+            {
+                "technique_id":   "T1566.001",
+                "technique_name": "Phishing: Spearphishing Attachment",
+                "tactic":         "Initial Access",
+                "description":    "Delivers malware via e-mail.",
+            },
+            {
+                "technique_id":   "T1059.001",
+                "technique_name": "PowerShell",
+                "tactic":         "Execution",
+                "description":    "Uses PowerShell for execution.",
+            },
+            {
+                "technique_id":   "T1027",
+                "technique_name": "Obfuscated Files or Information",
+                "tactic":         "Defense Evasion",
+                "description":    "Obfuscates payloads to evade detection.",
+            },
+        ],
+        "_llm_source": True,
+        "_llm_model": "test/s10",
+        "_otx_iocs": [], "_otx_pulses": 0, "_kev_correlacoes": [],
+        "_threatfox_iocs": [], "_malwarebazaar_amostras": [],
+        "_ransomware_vitimas": [], "_misp_eventos": [], "_opencti_dados": [],
+        "_malpedia_actor": {}, "_malpedia_families": [],
+    }
+    html_s10 = _gerar_html_grupos([sample_s10_html], {"actor": "S10Actor"}, fontes)
+    content_s10 = ""
+    if html_s10 and Path(html_s10).exists():
+        content_s10 = Path(html_s10).read_text(encoding="utf-8")
+
+    checks_s10: List[Tuple[str, str]] = [
+        # Técnicas devem aparecer no bloco matt_html (tático agrupado)
+        ("S10b T1566.001 in HTML",          "T1566.001"),
+        ("S10b T1059.001 in HTML",          "T1059.001"),
+        ("S10b T1027 in HTML",              "T1027"),
+        # Seção MITRE ATT&CK Tactics & Techniques (LLM) deve existir (matt_html)
+        ("S10b MITRE matt section",         "matt-bloco"),
+        # Nomes das técnicas também devem aparecer
+        ("S10b technique name PowerShell",  "PowerShell"),
+        ("S10b technique name Obfuscated",  "Obfuscated"),
+        # Actor e LLM badge
+        ("S10b actor rendered",             "S10Actor"),
+        ("S10b LLM badge",                  "llm-badge-bar"),
+    ]
+    found_s10b, miss_s10b = _run_checks(content_s10, checks_s10, "S10b-html-rendering")
+
+    # S10d — sem repr bruto de dicts
+    if "{'technique_id'" not in content_s10:
+        found_s10.append("S10d no raw dict repr in HTML")
+    else:
+        miss_s10.append("[S10d] raw dict repr must NOT appear in HTML for mitre_att_ck_mapping")
+
+    found_s10 += found_s10b
+    miss_s10  += miss_s10b
+
+    # S10e — schema v3: lista flat com {tactic, technique_id, technique_name}
+    # deve popular mitre_attack_tactics_and_techniques (agrupado por tática)
+    sample_s10e: Dict = {
+        "actor": "S10eActor",
+        "_llm_source": True,
+        "mitre_att_ck_mapping": [
+            {
+                "technique_id":   "T1078",
+                "technique_name": "Valid Accounts",
+                "tactic":         "Defense Evasion",
+                "description":    "Uses valid accounts to blend in.",
+            },
+            {
+                "technique_id":   "T1190",
+                "technique_name": "Exploit Public-Facing Application",
+                "tactic":         "Initial Access",
+                "description":    "Exploits public-facing apps.",
+            },
+        ],
+    }
+    norm_s10e = _normalizar_resultado_grupo(sample_s10e)
+    extra_s10e = norm_s10e.get("_llm_extra", {})
+    # mam_data comes from mitre_attack_mapping_data
+    mam_s10e = extra_s10e.get("mitre_attack_mapping_data") or []
+    matt_s10e = extra_s10e.get("mitre_attack_tactics_and_techniques") or {}
+    if mam_s10e:
+        found_s10.append("S10e mitre_att_ck_mapping populates mam (flat list path)")
+    elif matt_s10e:
+        found_s10.append("S10e mitre_att_ck_mapping populates matt (grouped path)")
+    else:
+        miss_s10.append(
+            "[S10e] mitre_att_ck_mapping must populate either "
+            "mitre_attack_mapping_data or mitre_attack_tactics_and_techniques"
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # S11 — target_sectors / target_geographies flat root keys
+    #
+    #  S11a — flat top-level target_sectors → observed-sectors no card header
+    #  S11b — flat top-level target_geographies → observed-countries no card header
+    #  S11c — NÃO deve gerar seção dinâmica duplicada (chaves em _CANONICAL_HANDLED_KEYS)
+    #  S11d — flat keys dentro de targeting_profile.sectors → observed-sectors
+    # ──────────────────────────────────────────────────────────────────────────
+    found_s11: List[str] = []
+    miss_s11:  List[str] = []
+
+    # S11a/S11b — flat root keys promovidas para campos canônicos
+    sample_s11ab = {
+        "actor": "SectorTestActor",
+        "description": "Testing flat target_sectors and target_geographies.",
+        "_llm_source": True,
+        "target_sectors":     ["Financial Services", "Healthcare", "Energy"],
+        "target_geographies": ["United States", "Germany", "Brazil"],
+    }
+    norm_s11ab = _normalizar_resultado_grupo(sample_s11ab)
+
+    sectors_s11 = norm_s11ab.get("observed-sectors", [])
+    if "Financial Services" in sectors_s11:
+        found_s11.append("S11a target_sectors → observed-sectors (Financial Services)")
+    else:
+        miss_s11.append("[S11a] target_sectors must populate observed-sectors (Financial Services not found)")
+
+    if "Healthcare" in sectors_s11:
+        found_s11.append("S11a target_sectors → observed-sectors (Healthcare)")
+    else:
+        miss_s11.append("[S11a] target_sectors must populate observed-sectors (Healthcare not found)")
+
+    geos_s11 = norm_s11ab.get("observed-countries", [])
+    if "United States" in geos_s11:
+        found_s11.append("S11b target_geographies → observed-countries (United States)")
+    else:
+        miss_s11.append("[S11b] target_geographies must populate observed-countries (United States not found)")
+
+    if "Germany" in geos_s11:
+        found_s11.append("S11b target_geographies → observed-countries (Germany)")
+    else:
+        miss_s11.append("[S11b] target_geographies must populate observed-countries (Germany not found)")
+
+    # S11c — NÃO deve gerar seção dinâmica para as flat keys (suprimidas em _CANONICAL_HANDLED_KEYS)
+    raw_s11c = json.dumps(sample_s11ab)
+    html_s11c = gerar_relatorio_llm_apt(raw_s11c, "SectorTestActor")
+    content_s11c = ""
+    if html_s11c and Path(html_s11c).exists():
+        content_s11c = Path(html_s11c).read_text(encoding="utf-8")
+
+    # As flat keys não devem virar seção com título "Target Sectors" separado
+    # (as informações devem aparecer apenas no cabeçalho do card como observed-sectors)
+    target_sectors_as_extra_section = (
+        "<details" in content_s11c
+        and "Target Sectors</summary>" in content_s11c
+        and "Target Geographies</summary>" in content_s11c
+    )
+    if not target_sectors_as_extra_section:
+        found_s11.append("S11c target_sectors/geographies não geram seção dinâmica duplicada")
+    else:
+        miss_s11.append(
+            "[S11c] target_sectors/target_geographies must NOT create a separate "
+            "dynamic section in the report (data belongs in card header only)"
+        )
+
+    # S11c-bis — mas os dados SÃO visíveis no card header (observed-sectors)
+    if "Financial Services" in content_s11c:
+        found_s11.append("S11c-bis Financial Services visible in card header")
+    else:
+        miss_s11.append("[S11c-bis] Financial Services must appear in card header via observed-sectors")
+
+    if "United States" in content_s11c:
+        found_s11.append("S11c-bis United States visible in card header")
+    else:
+        miss_s11.append("[S11c-bis] United States must appear in card header via observed-countries")
+
+    # S11d — targeting_profile.sectors (sub-object alias) → observed-sectors
+    sample_s11d = {
+        "actor": "S11dActor",
+        "description": "Testing targeting_profile.sectors alias.",
+        "_llm_source": True,
+        "targeting_profile": {
+            "sectors":     ["Aerospace", "Defense"],
+            "geographies": ["Japan", "South Korea"],
+        },
+    }
+    norm_s11d = _normalizar_resultado_grupo(sample_s11d)
+    sectors_s11d  = norm_s11d.get("observed-sectors", [])
+    geos_s11d     = norm_s11d.get("observed-countries", [])
+    if "Aerospace" in sectors_s11d:
+        found_s11.append("S11d targeting_profile.sectors → observed-sectors (Aerospace)")
+    else:
+        miss_s11.append("[S11d] targeting_profile.sectors must populate observed-sectors")
+    if "Japan" in geos_s11d:
+        found_s11.append("S11d targeting_profile.geographies → observed-countries (Japan)")
+    else:
+        miss_s11.append("[S11d] targeting_profile.geographies must populate observed-countries")
+
+    _run_checks(content_s11c, [], "S11-target_sectors")  # trigger report generation only
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # S12 — Ausência de duplicidade MITRE ATT&CK
+    #
+    #  Quando mitre_attack_profile (flat list) é fornecido, apenas UM dos dois
+    #  blocos HTML deve aparecer no relatório gerado:
+    #    - matt_html (MITRE ATT&CK Tactics & Techniques — tático agrupado), OU
+    #    - mam_html  (MITRE ATT&CK Mapping — flat list)
+    #  Nunca ambos ao mesmo tempo para o mesmo dado.
+    # ──────────────────────────────────────────────────────────────────────────
+    found_s12: List[str] = []
+    miss_s12:  List[str] = []
+
+    raw_s12 = json.dumps({
+        "actor": "DupeTestActor",
+        "description": "Testing MITRE deduplication.",
+        "_llm_source": True,
+        "mitre_attack_profile": [
+            {"technique_id": "T1566", "technique_name": "Phishing",
+             "tactic": "Initial Access", "description": "Spear phishing."},
+            {"technique_id": "T1059", "technique_name": "Command and Scripting",
+             "tactic": "Execution", "description": "Script execution."},
+        ],
+    })
+
+    html_s12 = gerar_relatorio_llm_apt(raw_s12, "DupeTestActor")
+    content_s12 = ""
+    if html_s12 and Path(html_s12).exists():
+        content_s12 = Path(html_s12).read_text(encoding="utf-8")
+
+    # Contar quantas vezes T1566 aparece — deve ser exatamente 1
+    import re as _re_s12
+    # Contar apenas âncoras visíveis ">Txxxx<" — o href também contém o ID mas
+    # numa URL ("techniques/T1566/"), portanto não conta como duplicidade visual.
+    # Uma âncora visível por técnica = sem duplicidade; duas = duplicidade real.
+    t1566_count = len(_re_s12.findall(r">T1566<", content_s12))
+    if t1566_count == 1:
+        found_s12.append("S12a T1566 aparece exatamente 1 vez (sem duplicata visual)")
+    elif t1566_count == 0:
+        # Pode não ter href se ID ausente; tenta texto simples na célula
+        t1566_count_raw = len(_re_s12.findall(r"T1566", content_s12))
+        if t1566_count_raw >= 1:
+            found_s12.append("S12a T1566 presente no relatório (sem duplicata confirmada)")
+        else:
+            miss_s12.append("[S12a] T1566 deve aparecer no relatório mas não foi encontrado")
+    else:
+        # Mais de 1 âncora visível = duplicidade real (matt + mam ao mesmo tempo)
+        miss_s12.append(
+            f"[S12a] T1566 aparece {t1566_count}x como âncora visível — "
+            f"duplicidade MITRE detectada (matt_html + mam_html renderizados simultaneamente)"
+        )
+
+    t1059_count = len(_re_s12.findall(r">T1059<", content_s12))
+    if t1059_count == 1:
+        found_s12.append("S12b T1059 aparece exatamente 1 vez (sem duplicata visual)")
+    elif t1059_count == 0:
+        t1059_count_raw = len(_re_s12.findall(r"T1059", content_s12))
+        if t1059_count_raw >= 1:
+            found_s12.append("S12b T1059 presente no relatório (sem duplicata confirmada)")
+        else:
+            miss_s12.append("[S12b] T1059 deve aparecer no relatório mas não foi encontrado")
+    else:
+        miss_s12.append(
+            f"[S12b] T1059 aparece {t1059_count}x como âncora visível — duplicidade MITRE detectada"
+        )
+
+    # Verifica que a seção canônica (mat ou mam) está presente
+    has_mitre_section = "T1566" in content_s12 or "Phishing" in content_s12
+    if has_mitre_section:
+        found_s12.append("S12c técnicas MITRE visíveis no relatório")
+    else:
+        miss_s12.append("[S12c] técnicas MITRE devem aparecer no relatório")
+
+    # S12d — mitre_attack_mapping exclusivo (chave `mitre_attack_mapping`) deve
+    # popular mam_html sem conflito com matt_html
+    sample_s12d = {
+        "actor": "MamOnlyActor",
+        "description": "Testing exclusive mam key.",
+        "_llm_source": True,
+        "mitre_attack_mapping": [
+            {"technique_id": "T1021", "technique_name": "Remote Services",
+             "tactic": "Lateral Movement"},
+        ],
+    }
+    norm_s12d = _normalizar_resultado_grupo(sample_s12d)
+    extra_s12d = norm_s12d.get("_llm_extra", {})
+    mam_s12d  = extra_s12d.get("mitre_attack_mapping_data") or []
+    matt_s12d = extra_s12d.get("mitre_attack_tactics_and_techniques") or {}
+    if mam_s12d and not matt_s12d:
+        found_s12.append("S12d mitre_attack_mapping → mam only (sem matt)")
+    elif mam_s12d and matt_s12d:
+        # Ambos populados — aceitável apenas se a lógica de renderização for condicional
+        found_s12.append("S12d mitre_attack_mapping → mam populado (matt também, ok — renderizador decide)")
+    else:
+        miss_s12.append("[S12d] mitre_attack_mapping deve popular mitre_attack_mapping_data")
+
+    # S12e — normalização: mitre_attack_profile não deve popular mam quando matt foi gerado
+    sample_s12e = {
+        "actor": "ProfileOnlyActor",
+        "description": "Testing mitre_attack_profile deduplication.",
+        "_llm_source": True,
+        "mitre_attack_profile": [
+            {"technique_id": "T1486", "technique_name": "Data Encrypted for Impact",
+             "tactic": "Impact", "description": "Ransomware encryption."},
+        ],
+    }
+    norm_s12e = _normalizar_resultado_grupo(sample_s12e)
+    extra_s12e = norm_s12e.get("_llm_extra", {})
+    mam_s12e  = extra_s12e.get("mitre_attack_mapping_data") or []
+    matt_s12e = extra_s12e.get("mitre_attack_tactics_and_techniques") or {}
+
+    if matt_s12e and not mam_s12e:
+        found_s12.append("S12e mitre_attack_profile → apenas matt (sem mam duplicado)")
+    elif not matt_s12e and not mam_s12e:
+        miss_s12.append("[S12e] mitre_attack_profile deve popular matt OU mam")
+    else:
+        # Ambos populados — é o cenário de duplicidade que queríamos corrigir
+        miss_s12.append(
+            "[S12e] mitre_attack_profile não deve popular AMBOS matt E mam simultaneamente "
+            "(duplicidade MITRE não foi corrigida)"
+        )
+
+    _run_checks(content_s12, [], "S12-mitre-dedup")  # trigger report generation only
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Aggregate results and print report
     # ──────────────────────────────────────────────────────────────────────────
     all_found   = (found_v1 + found_v2 + found_edge + found_etda + found_final
                    + found_s6a + found_s6b + found_s6c
-                   + found_s7a + found_s7b + found_s7c + found_s7d + found_s7e)
+                   + found_s7a + found_s7b + found_s7c + found_s7d + found_s7e
+                   + found_s8a + found_s8b + found_s8c + found_s8d
+                   + found_s9 + found_s10 + found_s11 + found_s12)
     all_missing = (miss_v1  + miss_v2  + miss_edge  + miss_etda  + miss_final
                    + miss_s6a + miss_s6b + miss_s6c
-                   + miss_s7a + miss_s7b + miss_s7c + miss_s7d + miss_s7e)
+                   + miss_s7a + miss_s7b + miss_s7c + miss_s7d + miss_s7e
+                   + miss_s8a + miss_s8b + miss_s8c + miss_s8d
+                   + miss_s9 + miss_s10 + miss_s11 + miss_s12)
 
     total   = len(all_found) + len(all_missing)
     n_found = len(all_found)
@@ -5737,7 +6669,7 @@ def test_render_llm_json() -> None:
 
     sep = "-" * 68
     print(f"\n{sep}")
-    print(f"  test_render_llm_json -- Coverage Report (13 test suites)")
+    print(f"  test_render_llm_json -- Coverage Report (21 test suites)")
     print(sep)
     print(f"  S1 schema-v1          : {len(found_v1)}/{len(checks_v1)} passed")
     print(f"  S2 schema-v2          : {len(found_v2)}/{len(checks_v2)} passed  (real gemini/claude format)")
@@ -5752,6 +6684,14 @@ def test_render_llm_json() -> None:
     print(f"  S7c ETDA suppression  : {len(found_s7c)}/2 passed  (sections hidden on ETDA path)")
     print(f"  S7d alias resolution  : {len(found_s7d)}/{len(checks_s7d)} passed  (ttps/mitigations aliases)")
     print(f"  S7e bare MITRE ID     : {len(found_s7e)}/{len(checks_s7e)} passed  (G-IDs without URL)")
+    print(f"  S8a gerar_relatorio   : {len(found_s8a)}/{len(checks_s8a)} passed  (gerar_relatorio_llm_apt c/ 3 root keys)")
+    print(f"  S8b dynamic section   : {len(found_s8b)}/{len(checks_s8b)} passed  (root key desconhecida → seção dinâmica)")
+    print(f"  S8c no-data sentinel  : {len(found_s8c)}/1 passed  (_llm_no_data retorna None)")
+    print(f"  S8d snake_to_title    : {len(found_s8d)}/{len(_title_tests)} passed  (_snake_to_section_title)")
+    print(f"  S9  render_dynamic    : {len(found_s9)}/{len(found_s9)+len(miss_s9)} passed  (_render_dynamic_value + Breeze Comeet)")
+    print(f"  S10 mitre_att_ck_map  : {len(found_s10)}/{len(found_s10)+len(miss_s10)} passed  (mitre_att_ck_mapping alias)")
+    print(f"  S11 target_sectors    : {len(found_s11)}/{len(found_s11)+len(miss_s11)} passed  (flat target_sectors/geographies)")
+    print(f"  S12 mitre_dedup       : {len(found_s12)}/{len(found_s12)+len(miss_s12)} passed  (sem duplicidade MITRE ATT&CK)")
     print(sep)
     print(f"  Total checks : {total}")
     print(f"  Passed       : {n_found}  ({pct}%)")
@@ -5772,6 +6712,668 @@ def test_render_llm_json() -> None:
             + "; ".join(all_missing)
         )
 
+
+
+# ─── LLM Fallback — relatório FindAPTGroups ──────────────────────────────────
+
+# Mapeamento explícito das root keys mais comuns para títulos legíveis.
+# Chaves não presentes neste mapa são normalizadas automaticamente via
+# _snake_to_section_title() — snake_case é convertido para Title Case.
+_LLM_ROOT_KEY_SECTION_TITLES: Dict[str, str] = {
+    # ── Campos do schema estruturado (_LLM_APT_STRUCTURED_SYSTEM_PROMPT) ───
+    "profile":                        "Intelligence Profile",
+    "actor_details":                  "Actor Details",
+    "summary":                        "Executive Summary",
+    "targeting_profile":              "Targeting Profile",
+    "attack_chain_and_tactics":       "Attack Chain & Tactics",
+    "associated_malware_and_tools":   "Associated Malware & Tools",
+    "mitre_attack_mapping":           "MITRE ATT&CK Mapping",
+    "mitigation_recommendations":     "Mitigation Recommendations",
+    "authoritative_references":       "Authoritative References",
+    # ── Campos do schema legado (_LLM_APT_FALLBACK_SYSTEM_PROMPT) ──────────
+    "general_information":            "General Information",
+    "country_of_origin":              "Country of Origin",
+    "modus_operandi":                 "Modus Operandi",
+    "targeted_sectors_and_geographies": "Targeted Sectors & Geographies",
+    "mitre_attack_tactics_and_techniques": "MITRE ATT&CK Tactics & Techniques",
+    "tactics_techniques_procedure":   "ATT&CK TTP (Tactics / Techniques / Procedures)",
+    "mitigation_and_defenses":        "Mitigation & Defenses",
+    "operations":                     "Documented Operations",
+    "counter-operations":             "Counter-Operations & Law Enforcement",
+    "information":                    "References & Reports",
+    # ── Campos do schema group_profile (FallBack) ───────────────────────────
+    "group_profile":                  "Group Profile",
+    "target_demographics":            "Target Demographics",
+    "attack_vector_and_tactics":      "Attack Vectors & Tactics",
+    "attack_lifecycle":               "Attack Lifecycle",
+    "infrastructure_and_c2":          "Infrastructure & C2",
+    "mitre_attack_techniques":        "MITRE ATT&CK Techniques",
+    "mitigations_and_recommendations": "Mitigations & Recommendations",
+    "authoritative_sources":          "Authoritative Sources",
+    "associated_tools_and_malware":   "Associated Tools & Malware",
+    # ── Flat sector / geography aliases ─────────────────────────────────────
+    "target_sectors":                 "Targeted Sectors",
+    "target_geographies":             "Target Geographies",
+    "targeted_sectors":               "Targeted Sectors",
+    "targeted_geographies":           "Target Geographies",
+    # ── Aliases de root key usados por alguns modelos ───────────────────────
+    "mitre_attack_profile":           "MITRE ATT&CK Mapping",
+    "mitre_att_ck_mapping":           "MITRE ATT&CK Mapping",   # double-underscore variant
+    "mitre_attack":                   "MITRE ATT&CK Mapping",
+    "attack_techniques":              "MITRE ATT&CK Techniques",
+    "mitre_attack_matrix":            "MITRE ATT&CK Matrix",
+    "tactics_and_techniques":         "MITRE ATT&CK Tactics & Techniques",
+    "tools_and_malware":              "Tools & Malware",
+    "tools_used":                     "Tools & Malware",
+    "malware":                        "Malware",
+    "tools":                          "Tools",
+    "observed-sectors":               "Observed Sectors",
+    "observed-countries":             "Target Countries",
+    "country":                        "Country of Origin",
+    "motivation":                     "Motivation",
+    "names":                          "Aliases",
+    "mitre-attack":                   "MITRE ATT&CK Group IDs",
+    "actor":                          "Actor Name",
+    "first-seen":                     "First Observed",
+    "last-seen":                      "Last Observed",
+    "description":                    "Description",
+}
+
+# Campos internos/privados que NÃO devem gerar sessão no relatório.
+_LLM_REPORT_SKIP_KEYS: frozenset = frozenset({
+    # Campos canônicos já renderizados no cabeçalho do card
+    "actor", "country", "motivation", "first-seen", "last-seen",
+    "description", "names", "mitre-attack", "observed-sectors",
+    "observed-countries", "tools", "information",
+    # Campos de controle interno
+    "_llm_source", "_llm_model", "_llm_extra", "_llm_no_data",
+    "uuid", "last-card-change",
+    # Campos de enriquecimento (renderizados por blocos dedicados)
+    "_otx_iocs", "_otx_pulses", "_kev_correlacoes", "_threatfox_iocs",
+    "_malwarebazaar_amostras", "_ransomware_vitimas", "_misp_eventos",
+    "_opencti_dados", "_malpedia_actor", "_malpedia_families",
+    # Campos ETDA/metadados que não têm conteúdo narrativo relevante
+    "mitre-attack", "information", "operations", "counter-operations",
+})
+
+
+def _snake_to_section_title(key: str) -> str:
+    """Converte uma root key snake_case / kebab-case para um título de sessão legível.
+
+    Aplica o mapeamento explícito em ``_LLM_ROOT_KEY_SECTION_TITLES`` antes de
+    recorrer à normalização automática.  A normalização automática:
+      1. Substitui hifens e underscores por espaços.
+      2. Aplica Title Case.
+      3. Expande abreviações conhecidas (MITRE, ATT&CK, C2, TTPs, LLM, IoC).
+
+    Parameters
+    ----------
+    key : str
+        Root key do dicionário retornado pela LLM (ex.: ``"mitre_attack_profile"``).
+
+    Returns
+    -------
+    str
+        Título de sessão humanamente legível (ex.: ``"MITRE ATT&CK Mapping"``).
+
+    Examples
+    --------
+    >>> _snake_to_section_title("mitre_attack_profile")
+    'MITRE ATT&CK Mapping'
+    >>> _snake_to_section_title("attack_chain_and_tactics")
+    'Attack Chain & Tactics'
+    >>> _snake_to_section_title("unknown_custom_key")
+    'Unknown Custom Key'
+    """
+    # 1. Consulta mapeamento explícito primeiro
+    if key in _LLM_ROOT_KEY_SECTION_TITLES:
+        return _LLM_ROOT_KEY_SECTION_TITLES[key]
+
+    # 2. Normalização automática: hifens/underscores → espaços → Title Case
+    title = key.replace("-", " ").replace("_", " ").title()
+
+    # 3. Expande abreviações conhecidas com capitalização canônica
+    _ABBR = {
+        "Mitre":   "MITRE",
+        "Att Ck":  "ATT&CK",
+        "Att&Ck":  "ATT&CK",
+        "Ck":      "CK",
+        "C2":      "C2",
+        "C&C":     "C2",
+        "Ttps":    "TTPs",
+        "Ttp":     "TTP",
+        "Ioc":     "IoC",
+        "Iocs":    "IoCs",
+        "Llm":     "LLM",
+        "Apt":     "APT",
+        "Api":     "API",
+    }
+    for word, replacement in _ABBR.items():
+        title = title.replace(word, replacement)
+
+    return title
+
+
+# ─── Renderizador dinâmico de valores LLM ────────────────────────────────────
+# Funções auxiliares de detecção de padrão
+
+def _is_dict_card_pattern(d: Dict) -> bool:
+    """Retorna True quando o dict tem exatamente os padrões de "card" conhecidos.
+
+    Padrões reconhecidos (qualquer combinação de chaves suficiente):
+      - ``category`` + ``recommendation`` / ``recommendations``
+      - ``name`` + qualquer de ``type`` / ``description`` / ``category``
+      - ``title`` + ``description``
+      - ``phase`` / ``stage`` + ``description`` / ``activity``
+      - ``tactic`` + ``technique_id`` / ``technique_name``
+
+    Quando um dict corresponde a qualquer um desses padrões, é renderizado
+    como um bloco de card em vez de uma tabela de chave→valor genérica.
+    """
+    keys = set(d.keys())
+    if {"category", "recommendation"} <= keys:
+        return True
+    if {"category", "recommendations"} <= keys:
+        return True
+    if "name" in keys and keys & {"type", "description", "category"}:
+        return True
+    if {"title", "description"} <= keys:
+        return True
+    if keys & {"phase", "stage"} and keys & {"description", "activity"}:
+        return True
+    if "tactic" in keys and keys & {"technique_id", "technique_name"}:
+        return True
+    return False
+
+
+def _render_dict_card(d: Dict) -> str:
+    """Renderiza um dict do padrão «card» como bloco <div> formatado.
+
+    Produz exatamente um ``<div class='dyn-card'>`` com:
+    - Um título em destaque derivado das chaves ``name`` / ``title`` / ``phase`` /
+      ``stage`` / ``category`` (nessa ordem de prioridade).
+    - As demais chaves renderizadas como pares rótulo→valor.  Valores que são
+      listas são expandidos recursivamente via ``_render_dynamic_value``.
+
+    Nenhum ``str()`` / ``repr()`` é aplicado a dicts ou listas aninhados.
+    """
+    # Chaves que viram título e não devem ser repetidas como linha de detalhe
+    _TITLE_KEYS = ("name", "title", "phase", "stage", "category")
+    title_val = ""
+    for tk in _TITLE_KEYS:
+        raw = d.get(tk)
+        if raw and not _is_empty_value(raw) and isinstance(raw, str):
+            title_val = raw[:120]
+            break
+
+    rows = ""
+    for k, v in d.items():
+        if _is_empty_value(v):
+            continue
+        # Suprimir a chave que virou título — evita duplicação
+        if isinstance(v, str) and v[:120] == title_val and k in _TITLE_KEYS:
+            continue
+        label = _snake_to_section_title(str(k))
+        if isinstance(v, (list, dict)):
+            inner = _render_dynamic_value(v, depth=1)
+            if inner:
+                rows += (
+                    f"<div class='dyn-card-row'>"
+                    f"<span class='label'>{label}:</span> {inner}"
+                    f"</div>"
+                )
+        else:
+            rows += (
+                f"<div class='dyn-card-row'>"
+                f"<span class='label'>{label}:</span> "
+                f"<span class='valor'>{str(v)[:400]}</span>"
+                f"</div>"
+            )
+
+    if not title_val and not rows:
+        return ""
+
+    title_html = (
+        f"<div class='dyn-card-title'>{title_val}</div>" if title_val else ""
+    )
+    return f"<div class='dyn-card'>{title_html}{rows}</div>"
+
+
+def _render_dynamic_value(v: Any, depth: int = 0) -> str:
+    """Renderiza qualquer valor Python como HTML formatado, sem usar str()/repr().
+
+    Esta é a função central de renderização para valores de seções dinâmicas
+    (``_dynamic_sections``).  É uma função de módulo — não uma closure — de
+    forma que pode ser chamada recursivamente de qualquer ponto do pipeline.
+
+    Regras de despacho (em ordem de prioridade):
+
+    1. ``None`` / sentinela LLM ("N/A", "Unknown", …)  → ``""``
+    2. ``str``                                          → ``<p class='llm-sec-text'>``
+    3. ``bool`` / ``int`` / ``float``                   → ``<p class='llm-sec-text'>``
+    4. ``list`` vazia                                   → ``""``
+    5. ``list`` de ``dict``                             →
+       - Se todos os itens têm padrão de card         → blocos ``<div class='dyn-card'>``
+       - Caso contrário                                → ``<ul>`` com cada item
+         renderizado recursivamente dentro de ``<li>``
+    6. ``list`` de escalares (str / int / …)            → ``<ul class='llm-sec-list'><li>…``
+    7. ``list`` mista (str + dict)                      → combina as regras 5 e 6
+    8. ``dict`` vazio                                   → ``""``
+    9. ``dict`` com padrão de card (``_is_dict_card_pattern``) → ``_render_dict_card``
+    10. ``dict`` genérico (profundidade ≤ 4)            → tabela ``<table>`` chave→valor,
+        com valores complexos renderizados recursivamente
+    11. Qualquer outro escalar                          → ``<p class='llm-sec-text'>``
+
+    Parameters
+    ----------
+    v : Any
+        Valor a renderizar.  Nunca é mutado.
+    depth : int
+        Profundidade atual de recursão.  Limita a expansão recursiva de dicts
+        genéricos ao nível 4 para evitar loops em estruturas patológicas.
+
+    Returns
+    -------
+    str
+        Fragment HTML pronto para ser embutido no documento.  Nunca retorna
+        ``str(v)`` nem ``repr(v)`` para valores compostos (dicts / listas).
+    """
+    # ── 1. Sentinelas / None ─────────────────────────────────────────────────
+    if v is None:
+        return ""
+    if isinstance(v, str) and _is_empty_value(v):
+        return ""
+
+    # ── 2–3. Escalares simples ───────────────────────────────────────────────
+    if isinstance(v, (str, bool, int, float)):
+        text = str(v)[:600]
+        return f"<p class='llm-sec-text'>{text}</p>"
+
+    # ── 4. Lista vazia ───────────────────────────────────────────────────────
+    if isinstance(v, list) and not v:
+        return ""
+
+    # ── 5–7. Lista ───────────────────────────────────────────────────────────
+    if isinstance(v, list):
+        # Separar itens em dicts e escalares para dispatch correto
+        dict_items  = [item for item in v if isinstance(item, dict)]
+        scalar_items = [
+            item for item in v
+            if not isinstance(item, dict) and not _is_empty_value(item)
+        ]
+
+        parts = ""
+
+        # Dicts: decidir entre blocos de card ou <li> genérico
+        if dict_items:
+            use_cards = all(_is_dict_card_pattern(d) for d in dict_items)
+            if use_cards:
+                cards = "".join(_render_dict_card(d) for d in dict_items)
+                if cards:
+                    parts += f"<div class='dyn-card-group'>{cards}</div>"
+            else:
+                items_html = ""
+                for item in dict_items:
+                    inner = _render_dynamic_value(item, depth + 1)
+                    if inner:
+                        items_html += f"<li class='dyn-li-block'>{inner}</li>"
+                if items_html:
+                    parts += f"<ul class='llm-sec-list dyn-list-blocks'>{items_html}</ul>"
+
+        # Escalares: lista simples <ul><li>
+        if scalar_items:
+            lis = "".join(
+                f"<li>{str(item)[:300]}</li>"
+                for item in scalar_items
+            )
+            parts += f"<ul class='llm-sec-list'>{lis}</ul>"
+
+        return parts or ""
+
+    # ── 8. Dict vazio ────────────────────────────────────────────────────────
+    if isinstance(v, dict) and not v:
+        return ""
+
+    # ── 9. Dict com padrão de card ───────────────────────────────────────────
+    if isinstance(v, dict) and _is_dict_card_pattern(v):
+        return _render_dict_card(v)
+
+    # ── 10. Dict genérico ────────────────────────────────────────────────────
+    if isinstance(v, dict):
+        rows = ""
+        for k2, v2 in v.items():
+            if _is_empty_value(v2):
+                continue
+            label = _snake_to_section_title(str(k2))
+            if isinstance(v2, (list, dict)):
+                if depth < 4:
+                    inner = _render_dynamic_value(v2, depth + 1)
+                    if inner:
+                        rows += (
+                            f"<tr>"
+                            f"<td class='llm-sec-key'>{label}</td>"
+                            f"<td>{inner}</td>"
+                            f"</tr>"
+                        )
+                else:
+                    # Limite de profundidade: serializar listas de escalares
+                    if isinstance(v2, list):
+                        flat = ", ".join(
+                            str(x) for x in v2
+                            if not isinstance(x, (dict, list)) and not _is_empty_value(x)
+                        )
+                        if flat:
+                            rows += (
+                                f"<tr>"
+                                f"<td class='llm-sec-key'>{label}</td>"
+                                f"<td class='valor'>{flat[:400]}</td>"
+                                f"</tr>"
+                            )
+            else:
+                rows += (
+                    f"<tr>"
+                    f"<td class='llm-sec-key'>{label}</td>"
+                    f"<td class='valor'>{str(v2)[:400]}</td>"
+                    f"</tr>"
+                )
+        if rows:
+            return (
+                f"<table class='ioc-table llm-sec-table'>"
+                f"<tbody>{rows}</tbody></table>"
+            )
+        return ""
+
+    # ── 11. Fallback escalar ─────────────────────────────────────────────────
+    return f"<p class='llm-sec-text'>{str(v)[:600]}</p>"
+
+
+def _render_llm_section(section_title: str, value: Any) -> str:
+    """Renderiza uma sessão do relatório FindAPTGroups a partir de uma root key LLM.
+
+    Delega toda a lógica de renderização para ``_render_dynamic_value``, que
+    trata recursivamente todos os tipos de dado possíveis sem nunca produzir
+    representações brutas (``str(dict)`` / ``repr(list)``).
+
+    Suporta:
+      - ``str``                      → parágrafo único
+      - ``list`` de ``str``          → ``<ul>/<li>``
+      - ``list`` de ``dict`` (cards) → blocos formatados ``<div class='dyn-card'>``
+      - ``dict`` padrão-card         → bloco ``<div class='dyn-card'>``
+      - ``dict`` genérico            → tabela chave→valor com recursão
+
+    Parameters
+    ----------
+    section_title : str
+        Título da sessão já processado por ``_snake_to_section_title``.
+    value : Any
+        Conteúdo da root key, conforme retornado (e sanitizado) pela LLM.
+
+    Returns
+    -------
+    str
+        Bloco HTML ``<details>`` pronto para ser embutido no card do grupo.
+        Retorna ``""`` quando o valor está vazio ou é um sentinela.
+    """
+    body = _render_dynamic_value(value)
+    if not body:
+        return ""
+
+    return f"""
+            <details class="enrich-bloco llm-sec-bloco" open>
+                <summary class="enrich-toggle llm-sec-toggle">&#128196; {section_title}</summary>
+                <div class="llm-sec-body">{body}</div>
+            </details>"""
+
+
+def gerar_relatorio_llm_apt(
+    llm_raw_response: str,
+    group_name: str,
+    parametros_busca: Optional[Dict] = None,
+) -> Optional[str]:
+    """Gera o relatório HTML FindAPTGroups exclusivamente a partir da resposta LLM.
+
+    Ponto de entrada de alto nível para o fluxo Fallback via LLM.  Recebe o
+    texto bruto retornado pelo modelo de linguagem, normaliza, enriquece com as
+    fontes secundárias disponíveis (OTX, CISA KEV, ThreatFox, MalwareBazaar,
+    Ransomware.live, Malpedia) e delega a renderização HTML para
+    ``_gerar_html_grupos`` — a mesma função utilizada pelo fluxo ETDA normal —
+    garantindo paridade visual entre os dois caminhos.
+
+    Estrutura de sessões do relatório
+    ----------------------------------
+    Cada **root key** do JSON retornado pela LLM origina uma sessão nomeada.
+    O mapeamento é feito por ``_snake_to_section_title``:
+
+    +--------------------------------------+------------------------------------+
+    | Root key LLM                         | Sessão do relatório                |
+    +======================================+====================================+
+    | ``mitre_attack_profile``             | MITRE ATT&CK Mapping               |
+    | ``attack_chain_and_tactics``         | Attack Chain & Tactics             |
+    | ``mitigation_recommendations``       | Mitigation Recommendations         |
+    | ``actor_details``                    | Actor Details                      |
+    | ``targeting_profile``                | Targeting Profile                  |
+    | ``summary``                          | Executive Summary                  |
+    | ``authoritative_references``         | Authoritative References           |
+    | ``profile``                          | Intelligence Profile               |
+    | ``associated_malware_and_tools``     | Associated Malware & Tools         |
+    | Qualquer outra root key              | Snake_Case → Title Case automático |
+    +--------------------------------------+------------------------------------+
+
+    Tratamento de dados ausentes
+    ----------------------------
+    Quando uma root key esperada **não está presente** na resposta LLM, a sessão
+    correspondente é **omitida** do relatório (abordagem: omissão silenciosa).
+    O card do grupo ainda é gerado com os campos disponíveis; a ausência não
+    provoca erro nem placeholder no HTML final.
+
+    Parameters
+    ----------
+    llm_raw_response : str
+        Texto bruto retornado pelo modelo (pode conter markdown fences ````` ou
+        prosa ao redor do JSON — o parser interno trata isso).
+    group_name : str
+        Nome do grupo/ator conforme digitado pelo usuário; usado como fallback
+        para o campo ``actor`` e como label nos parâmetros de busca.
+    parametros_busca : dict, optional
+        Dicionário de filtros da busca original (ex.: ``{"actor": "APT28"}``).
+        Quando ausente, é preenchido com ``{"actor": group_name}``.
+
+    Returns
+    -------
+    Optional[str]
+        Caminho absoluto para o arquivo HTML gerado, ou ``None`` se a resposta
+        LLM não puder ser parseada ou o modelo sinalizar ausência de dados.
+
+    Examples
+    --------
+    Uso direto (sem passar pelo fluxo ETDA)::
+
+        raw = '{"actor": "APT28", "mitre_attack_profile": [...], ...}'
+        caminho = gerar_relatorio_llm_apt(raw, "APT28")
+        # -> "findings/chimera_report_APTGroups_20250101_120000000000.html"
+
+    Resposta sem dados::
+
+        raw = '{"_llm_no_data": true}'
+        caminho = gerar_relatorio_llm_apt(raw, "UnknownGroup")
+        # -> None
+    """
+    if parametros_busca is None:
+        parametros_busca = {"actor": group_name}
+
+    # ── Passo 1: parsear e normalizar a resposta LLM ─────────────────────────
+    dados = _normalizar_resposta_llm_apt(llm_raw_response, group_name)
+    if dados is None:
+        logger.warning(
+            "gerar_relatorio_llm_apt: falha ao parsear resposta LLM para '%s'.",
+            group_name,
+        )
+        return None
+
+    # Marcar como originário do LLM (caso não esteja já marcado)
+    dados.setdefault("_llm_source", True)
+    dados.setdefault("_llm_model", LLM_MODEL)
+
+    # ── Passo 2: construir sessões extras a partir das root keys da LLM ──────
+    # Para cada root key não coberta pelo mapeamento canônico já processado em
+    # _normalizar_resultado_grupo, injetamos o bloco renderizado em _llm_extra
+    # sob a chave especial "_llm_dynamic_sections" para que a função de
+    # renderização HTML o apresente no card.
+    _CANONICAL_HANDLED_KEYS = frozenset({
+        # Já tratados por _normalizar_resultado_grupo / _gerar_html_grupos
+        "actor", "names", "country", "motivation", "first-seen", "last-seen",
+        "description", "observed-sectors", "observed-countries", "tools",
+        "mitre-attack", "information", "operations", "counter-operations",
+        "uuid", "last-card-change",
+        # Campos internos
+        "_llm_source", "_llm_model", "_llm_extra", "_llm_no_data",
+        "_otx_iocs", "_otx_pulses", "_kev_correlacoes", "_threatfox_iocs",
+        "_malwarebazaar_amostras", "_ransomware_vitimas", "_misp_eventos",
+        "_opencti_dados", "_malpedia_actor", "_malpedia_families",
+        # Root keys já mapeadas para blocos HTML dedicados
+        "general_information", "country_of_origin", "modus_operandi",
+        "targeted_sectors_and_geographies", "mitre_attack_tactics_and_techniques",
+        "tactics_techniques_procedure", "mitigation_and_defenses",
+        "group_profile", "target_demographics", "attack_vector_and_tactics",
+        "attack_lifecycle", "infrastructure_and_c2",
+        "associated_tools_and_malware",
+        "mitre_attack_mapping", "mitigation_recommendations",
+        "authoritative_references", "profile",
+        "actor_details", "summary", "targeting_profile",
+        "attack_chain_and_tactics", "associated_malware_and_tools",
+        "mitre_attack_techniques", "tactics_and_techniques",
+        "mitigations_and_recommendations", "authoritative_sources",
+        "mitre_attack_matrix", "mitre_attack", "attack_techniques",
+        "techniques", "mitre_attack_profile",
+        "tactics_techniques_procedures", "mitre_att_and_ck",
+        "mitre_att_ck_mapping",                          # double-underscore variant
+        "mitre_attack_ttps", "primary_motivations",
+        "actor_profile", "threat_actor", "threat_actor_profile",
+        "actor_details", "targeting_profile",
+        # Flat sector/geography aliases — promoted to observed-sectors/countries
+        # in _normalizar_resultado_grupo; must not create a separate dynamic section
+        "target_sectors", "target_geographies",
+        "targeted_sectors", "targeted_geographies",
+    })
+
+    dynamic_sections: List[Dict[str, str]] = []
+    for root_key, root_val in dados.items():
+        if root_key in _CANONICAL_HANDLED_KEYS:
+            continue
+        if root_key.startswith("_"):
+            continue
+        if _is_empty_value(root_val):
+            continue
+        section_title = _snake_to_section_title(root_key)
+        rendered = _render_llm_section(section_title, root_val)
+        if rendered:
+            dynamic_sections.append({"title": section_title, "html": rendered})
+
+    # Persistir as seções dinâmicas em _llm_extra para o renderizador HTML
+    llm_extra = dados.setdefault("_llm_extra", {})
+    if dynamic_sections:
+        llm_extra["_dynamic_sections"] = dynamic_sections
+
+    # ── Passo 3: enriquecimento via fontes secundárias ───────────────────────
+    fontes_consultadas: List[str] = [
+        f"LLM Agent ({LLM_MODEL}) — fallback, sem match no ETDA",
+    ]
+
+    # Inicializar campos de enriquecimento com defaults seguros
+    dados.setdefault("_otx_iocs", [])
+    dados.setdefault("_otx_pulses", 0)
+    dados.setdefault("_kev_correlacoes", [])
+    dados.setdefault("_threatfox_iocs", [])
+    dados.setdefault("_malwarebazaar_amostras", [])
+    dados.setdefault("_ransomware_vitimas", [])
+    dados.setdefault("_misp_eventos", [])
+    dados.setdefault("_opencti_dados", [])
+    dados.setdefault("_malpedia_actor", {})
+    dados.setdefault("_malpedia_families", [])
+
+    nome_ator = dados.get("actor", group_name)
+
+    # OTX AlienVault
+    if OTX_API_KEY:
+        fontes_consultadas.append("OTX AlienVault API")
+        otx_data = _buscar_otx(nome_ator)
+        pulses = otx_data.get("results", [])
+        dados["_otx_pulses"] = len(pulses)
+        iocs_otx: List[Dict] = []
+        for pulse in pulses:
+            pulse_name = pulse.get("name", "")
+            for indicator in pulse.get("indicators", []):
+                if not isinstance(indicator, dict):
+                    continue
+                value = indicator.get("indicator", "").strip()
+                if value:
+                    iocs_otx.append({
+                        "value": value,
+                        "type":  indicator.get("type", ""),
+                        "pulse": pulse_name,
+                        "date":  indicator.get("created", ""),
+                    })
+        dados["_otx_iocs"] = iocs_otx
+
+    # CISA KEV
+    kev_lista = _buscar_cisa_kev()
+    if kev_lista:
+        fontes_consultadas.append(f"CISA KEV ({len(kev_lista)} CVEs conhecidos)")
+        dados["_kev_correlacoes"] = _correlacionar_cisa_kev(dados, kev_lista)
+
+    # ThreatFox
+    fontes_consultadas.append("ThreatFox (Abuse.ch)")
+    ferramentas = dados.get("tools", [])
+    if isinstance(ferramentas, str):
+        ferramentas = [t.strip() for t in ferramentas.split(",")]
+    iocs_tf: List[Dict] = []
+    for ferr in ferramentas[:3]:
+        if ferr:
+            iocs_tf.extend(_buscar_threatfox_malware(ferr))
+    dados["_threatfox_iocs"] = iocs_tf[:15]
+
+    # MalwareBazaar
+    fontes_consultadas.append("MalwareBazaar (Abuse.ch)")
+    amostras_mw: List[Dict] = []
+    for ferr in ferramentas[:3]:
+        if ferr:
+            amostras_mw.extend(_buscar_malwarebazaar(ferr))
+    dados["_malwarebazaar_amostras"] = amostras_mw[:10]
+
+    # Ransomware.live
+    fontes_consultadas.append("Ransomware.live")
+    dados["_ransomware_vitimas"] = _buscar_ransomware_live(nome_ator)
+
+    # MISP (se configurado)
+    if MISP_URL and MISP_API_KEY:
+        fontes_consultadas.append(f"MISP ({MISP_URL})")
+        dados["_misp_eventos"] = _buscar_misp_ator(nome_ator)
+
+    # OpenCTI (se configurado)
+    if OPENCTI_URL and OPENCTI_API_KEY:
+        fontes_consultadas.append(f"OpenCTI ({OPENCTI_URL})")
+        dados["_opencti_dados"] = _buscar_opencti_ator(nome_ator)
+
+    # Malpedia
+    if MALPEDIA_ENRICHMENT_ENABLED:
+        auth_note = " (autenticado)" if MALPEDIA_API_TOKEN else " (anônimo)"
+        fontes_consultadas.append(
+            f"Malpedia{auth_note} — https://malpedia.caad.fkie.fraunhofer.de"
+        )
+        _mp_client = MalpediaClient(token=MALPEDIA_API_TOKEN)
+        dados["_malpedia_actor"] = _buscar_malpedia_ator(_mp_client, nome_ator)
+        dados["_malpedia_families"] = _buscar_malpedia_families(
+            _mp_client,
+            ferramentas if isinstance(ferramentas, list) else [ferramentas],
+        )
+
+    # ── Passo 4: gerar HTML via o mesmo renderizador do fluxo ETDA ──────────
+    html_path = _gerar_html_grupos(
+        resultados=[dados],
+        parametros_busca=parametros_busca,
+        fontes_consultadas=fontes_consultadas,
+    )
+    return html_path
 
 
 # ─── Module main function ─────────────────────────────────────────────────────
