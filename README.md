@@ -9,7 +9,7 @@ CHIMERA is an end-to-end threat intelligence and threat hunting platform that le
 
 ## Overview
 
-<img width="1298" height="610" alt="Chime_Fluxo" src="https://github.com/user-attachments/assets/c77c97ca-605a-4a4f-98f3-675b5e6ecd6a" />
+<img width="1298" height="610" alt="Chime_Fluxo" src="https://github.com/thexhunt3r/chimera/blob/main/fluxo_chimerav1.png" />
 
 The tool integrates four modules that can run independently or chained together:
 
