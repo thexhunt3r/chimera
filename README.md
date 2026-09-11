@@ -1,11 +1,11 @@
-# CHIMERA — Threat Intelligence & Hunting Platform
+# CHIMERA — Threat Intelligence & Hunting Tool
 <div align="center"><img width="607" height="411" alt="CHIMERA-CTIH" src="https://github.com/thexhunt3r/chimera/blob/main/chimera_logo.png" /> </div>
 
 ```
 > v2.0 · by X-hunt3r
 ```
 
-CHIMERA is an end-to-end threat intelligence and threat hunting platform that lets analysts go from a threat actor name all the way to SIEM-ready detection queries in a single workflow.
+CHIMERA is an end-to-end threat intelligence and threat hunting tool that lets analysts go from a threat actor name all the way to SIEM-ready detection queries in a single workflow.
 
 ## Overview
 
